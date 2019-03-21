@@ -30,16 +30,23 @@
          terminate/2,
          code_change/3]).
 
--define(SERVER, ?MODULE).
-
 -define(APP, vmq_cloudwatch_metrics).
 
 %% The default interval used to send the data to AWS Cloudwatch.
 -define(DEFAULT_INTERVAL, 60000).
 
+-record(metric_def,
+        {type        :: atom(),
+         labels      :: [{atom(), string()}],
+         id          :: atom() | {atom(), non_neg_integer() | atom()},
+         name        :: atom(),
+         description :: undefined | binary()}).
+
 -record(state, {
-    namespace  :: string(),    %% The Cloudwatch Metrics namespace.
-    config     :: aws_config() %% AWS config.
+    namespace   :: string(),     %% The Cloudwatch Metrics namespace.
+    config      :: aws_config(), %% AWS config.
+    interval    :: non_neg_integer(),
+    node_name   :: string()
 }).
 
 -type state() :: #state{}.
@@ -51,7 +58,7 @@
 %%--------------------------------------------------------------------
 -spec start_link() -> ignore | {error, Reason :: term()} | {'ok', pid()}.
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 
 %%%===================================================================
@@ -69,24 +76,40 @@ start_link() ->
     {ok, State :: state()} | {ok, State :: state(), timeout() | hibernate} |
     {stop, Reason :: term()} | ignore).
 init([]) ->
-    {ok, Profile} = application:get_env(?APP, aws_profile, "default"),
+    Interval = application:get_env(?APP, interval, ?DEFAULT_INTERVAL),
+    NodeName = application:get_env(?APP, node_name, atom_to_list(node())),
+    {ok, Enabled} = application:get_env(?APP, cloudwatch_enabled),
     {ok, Region} = application:get_env(?APP, aws_region),
     {ok, AccessKeyID} = application:get_env(?APP, aws_access_key_id),
     {ok, SecretAccessKey} = application:get_env(?APP, aws_secret_access_key),
     {ok, Namespace} = application:get_env(?APP, namespace),
-    AWSConfig = case has_config_credentials(AccessKeyID, SecretAccessKey) of
+    AWSConfig = case Enabled of
         true ->
-            lager:info("AWS credentials configured"),
-            Conf = erlcloud_mon:new(AccessKeyID, SecretAccessKey),
-            Conf;
+            case has_config_credentials(AccessKeyID, SecretAccessKey) of
+                true ->
+                    lager:info("AWS credentials configured."),
+                    Conf = erlcloud_mon:new(AccessKeyID, SecretAccessKey),
+                    Conf;
+                false ->
+                    %% TODO: attempt to fetch the AWS access key and secret automatically.
+                    lager:warning("AWS credentials not configured correctly."),
+                    undefined
+            end;
         false ->
-           %% This will attempt to fetch the AWS access key and secret automatically.
-           lager:info("AWS credentials not configured, attempting to get them automatically..."),
-           {ok, Conf} = erlcloud_aws:auto_config([{profile, Profile}]),
-           Conf
-     end,
-    CloudWatchConfig = erlcloud_aws:service_config(<<"monitoring">>, Region, AWSConfig),
-    {ok, #state{namespace = Namespace, config = CloudWatchConfig}, 0}.
+            undefined
+    end,
+    case AWSConfig of
+        undefined ->
+            {ok, #state{}};
+        _ ->
+            CloudWatchConfig = erlcloud_aws:service_config(<<"mon">>, Region, AWSConfig),
+            schedule_report(Interval),
+            State = #state{namespace = Namespace,
+                           config = CloudWatchConfig,
+                           interval = Interval,
+                           node_name = NodeName},
+            {ok, State}
+    end.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -127,27 +150,20 @@ handle_cast(_Msg, State) ->
 %% Handling all non call/cast messages
 %% @end
 %%--------------------------------------------------------------------
-handle_info(timeout, State = #state{namespace = Namespace, config = Config}) ->
-    {ok, Enabled} = application:get_env(?APP, cloudwatch_enabled),
-    case Enabled of
-        true ->
-            lager:debug("Sending metrics to cloudwatch."),
-            Interval = application:get_env(?APP, interval, ?DEFAULT_INTERVAL),
-            ServerMetrics = vmq_metrics:metrics(),
-            %% Metrics come in chunks of 20 items due to AWS limitation.
-            Metrics = build_metric_datum(ServerMetrics, []),
-            lists:foreach(
-                fun(MetricsChunk) ->
-                    erlcloud_mon:put_metric_data(Namespace,
-                                                 MetricsChunk,
-                                                 Config)
-                end, Metrics),
-            {noreply, State, Interval};
-        false ->
-            %% Cloudwatch reporting not enabled
-            %% Retry in 5 seconds.
-            {noreply, State, 5000}
-    end.
+handle_info(report, State = #state{namespace = Namespace,
+                                   config = Config,
+                                   interval = Interval,
+                                   node_name = NodeName}) ->
+    lager:debug("Sending metrics to cloudwatch."),
+    ServerMetrics = vmq_metrics:metrics(#{aggregate => false}),
+    %% Metrics come in chunks of 20 items due to AWS limitation.
+    Metrics = build_metric_datum(NodeName, ServerMetrics, []),
+    lists:foreach(
+        fun(Chunk) ->
+            erlcloud_mon:put_metric_data(Namespace, Chunk, Config)
+        end, Metrics),
+    schedule_report(Interval),
+    {noreply, State}.
 
 
 %%--------------------------------------------------------------------
@@ -190,17 +206,17 @@ code_change(_OldVsn, State, _Extra) ->
 %% APIReference/API_MetricDatum.html
 %% @end
 %%--------------------------------------------------------------------
-build_metric_datum([{Type, Name, Val} | Metrics], Acc) ->
+build_metric_datum(NodeName, [{#metric_def{type=Type, name=Name}, Val} | Metrics], Acc) ->
         Metric = #metric_datum{
             metric_name = atom_to_list(Name),
             dimensions  = [
-                #dimension{name = "node", value = atom_to_list(node())}
+                #dimension{name = "node", value = NodeName}
             ],
             unit = unit({Type, Name}),
             value = value(Val)
         },
-        build_metric_datum(Metrics, [Metric|Acc]);
-build_metric_datum([], Acc) ->
+        build_metric_datum(NodeName, Metrics, [Metric|Acc]);
+build_metric_datum(_NodeName, [], Acc) ->
     %% Split the metrics in sublists due to CloudWatch `PutMetricData`
     %% limitation of 20 metrics per call.
     %% https://docs.aws.amazon.com/AmazonCloudWatch/latest/
@@ -293,3 +309,6 @@ is_list(AccessKeyID), is_list(SecretAccessKey) ->
         _ -> true
     end.
 
+-spec schedule_report(non_neg_integer()) -> reference().
+schedule_report(Interval) ->
+    erlang:send_after(Interval, self(), report).

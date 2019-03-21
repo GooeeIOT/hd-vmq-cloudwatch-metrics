@@ -40,8 +40,7 @@
                                                               {datatype, string}
                                                             ]}.
 
-%% @doc Set the AWS Profile.
-{mapping, "vmq_cloudwatch_metrics.aws_profile", "vmq_cloudwatch_metrics.aws_profile", [
-                                                              {default, "default"},
+%% @doc Override node name. Hack for docker changing container ips on Elastic beanstalk.
+{mapping, "vmq_cloudwatch_metrics.node_name", "vmq_cloudwatch_metrics.node_name", [
                                                               {datatype, string}
-                                                            ]}.
+                                                          ]}.
